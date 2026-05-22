@@ -626,6 +626,26 @@ async def get_max_rss_mb(remote: Remote, job_id: int) -> int | None:
     return max(values) if values else None
 
 
+async def get_elapsed_s(remote: Remote, job_id: int) -> int | None:
+    """Read elapsed wall time of `job_id` from sacct, in seconds.
+
+    Returns None if sacct reports no parseable value. The allocation row carries
+    the canonical elapsed time; per-step rows can be shorter, so we keep the max.
+    """
+    sacct_command = f"sacct -j {job_id} --format=ElapsedRaw --noheader --parsable2"
+    output = await remote.get_output(sacct_command)
+    values: list[int] = []
+    for line in output.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            values.append(int(raw))
+        except ValueError:
+            continue
+    return max(values) if values else None
+
+
 async def cancel_job(remote: Remote, job_id: int) -> str:
     """Cancel the job with the given id on the remote cluster."""
     scancel_command = f"scancel {job_id}"

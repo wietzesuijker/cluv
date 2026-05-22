@@ -23,6 +23,7 @@ from .cli.estimate import estimate
 from .cli.history import history
 from .cli.init import init
 from .cli.login import login
+from .cli.probe import probe
 from .cli.run import run
 from .cli.status import status
 from .cli.submit import submit
@@ -39,20 +40,23 @@ def main(argv: list[str] | None = None) -> None:
         argv = sys.argv[1:]
 
     # argparse consumes '--' before REMAINDER sees it, so we extract program
-    # args (everything after the first '--' following 'submit' or 'estimate')
-    # before parsing.
+    # args (everything after the first '--' following 'submit', 'estimate' or
+    # 'probe') before parsing.
     submit_program_args: list[str] = []
     estimate_program_args: list[str] = []
-    for cmd_name, sink in (("submit", "submit"), ("estimate", "estimate")):
+    probe_program_args: list[str] = []
+    for cmd_name in ("submit", "estimate", "probe"):
         try:
             sub_idx = argv.index(cmd_name)
             sep_idx = argv.index("--", sub_idx + 1)
             extracted = list(argv[sep_idx + 1 :])
             argv = list(argv[:sep_idx])
-            if sink == "submit":
+            if cmd_name == "submit":
                 submit_program_args = extracted
-            else:
+            elif cmd_name == "estimate":
                 estimate_program_args = extracted
+            else:
+                probe_program_args = extracted
         except ValueError:
             continue
 
@@ -87,6 +91,9 @@ def main(argv: list[str] | None = None) -> None:
     estimate_parser = add_estimate_args(subparsers)
     _add_v_arg(estimate_parser)
 
+    probe_parser = add_probe_args(subparsers)
+    _add_v_arg(probe_parser)
+
     history_parser = add_history_args(subparsers)
     _add_v_arg(history_parser)
 
@@ -102,6 +109,8 @@ def main(argv: list[str] | None = None) -> None:
         args_dict["program_args"] = submit_program_args
     elif subcommand == "estimate":
         args_dict["program_args"] = estimate_program_args
+    elif subcommand == "probe":
+        args_dict["program_args"] = probe_program_args
 
     try:
         if inspect.iscoroutinefunction(function):
@@ -178,6 +187,50 @@ def add_estimate_args(subparsers: Subparsers) -> argparse.ArgumentParser:
     )
     estimate_parser.set_defaults(func=estimate, backfill=True)
     return estimate_parser
+
+
+def add_probe_args(subparsers: Subparsers) -> argparse.ArgumentParser:
+    probe_parser = subparsers.add_parser(
+        "probe",
+        help="Submit one throwaway job to seed the memory history cache.",
+        description=(
+            "Submit one throwaway job to give the memory estimator its first sample. "
+            "Cluv sets CLUV_PROBE=1 in the job env; have your script honor it with "
+            'something like `[ -n "$CLUV_PROBE" ] && { one_batch; exit; }` so the '
+            "probe runs cheaply instead of paying for a full job."
+        ),
+        formatter_class=rich_argparse.RichHelpFormatter,
+        usage="cluv probe <cluster> <job.sh> [--mem 64G] [--time 00:10:00] [-- program-args...]",
+    )
+    probe_parser.add_argument(
+        "cluster",
+        metavar="<cluster>",
+        help="The cluster to submit the probe job on.",
+    )
+    probe_parser.add_argument(
+        "job_script",
+        metavar="<job.sh>",
+        help="Path to the sbatch job script (relative to project root).",
+    )
+    probe_parser.add_argument(
+        "--mem",
+        default="64G",
+        help="Generous memory ceiling for the probe job. Default: 64G.",
+    )
+    probe_parser.add_argument(
+        "--time",
+        default="00:10:00",
+        help="Wall time for the probe job. Default: 00:10:00.",
+    )
+    probe_parser.add_argument(
+        "--cpus-per-task",
+        type=int,
+        default=1,
+        dest="cpus_per_task",
+        help="CPUs per task for the probe job. Default: 1.",
+    )
+    probe_parser.set_defaults(func=probe)
+    return probe_parser
 
 
 def add_history_args(subparsers: Subparsers) -> argparse.ArgumentParser:
