@@ -178,6 +178,7 @@ async def submit(
         initial_mem=initial_mem,
         retry=cluv_config.retry,
         write_back=estimate_cfg is not None,
+        estimate_cfg=estimate_cfg,
     )
 
 
@@ -335,8 +336,12 @@ async def _resolve_estimate(
 
 async def _persist_terminal(
     remote: Remote, cluster: str, key: str, job_id: int, mem_for_job: str
-) -> None:
-    """Read the job's terminal sacct row and append a JobRecord to the cache."""
+) -> tuple[str, int, int | None]:
+    """Read the job's terminal sacct row and append a JobRecord to the cache.
+
+    Returns ``(state, mem_mb, max_rss_mb)`` so callers can build the observability
+    line without re-querying sacct.
+    """
     from salvo.history import JobRecord
     from salvo.job.spec import parse_mem_mb
 
@@ -358,6 +363,54 @@ async def _persist_terminal(
             submitted_at=datetime.now(UTC),
         )
     )
+    return state or "UNKNOWN", mem_mb, max_rss
+
+
+def _log_post_job_summary(
+    cluster: str,
+    key: str,
+    job_id: int,
+    state: str,
+    mem_mb: int,
+    max_rss_mb: int | None,
+    estimate_cfg: EstimateConfig,
+) -> None:
+    """Print one-line ask-vs-use-vs-prediction summary plus any over-ask suggestion.
+
+    Utilization renders as ``--`` when MaxRSS is missing or the salvo
+    degenerate-MaxRSS heuristic would discard the reading, so we don't print a
+    misleading 1%.
+    """
+    from salvo.history import DEGENERATE_RSS_RATIO, estimate_mem, format_suggestion
+
+    if (
+        max_rss_mb is None
+        or max_rss_mb <= 0
+        or mem_mb <= 0
+        or (state == "COMPLETED" and max_rss_mb < mem_mb * DEGENERATE_RSS_RATIO)
+    ):
+        util = "--"
+        peak = "--" if max_rss_mb is None else str(max_rss_mb)
+    else:
+        util = f"{round(100 * max_rss_mb / mem_mb)}%"
+        peak = str(max_rss_mb)
+
+    records = history.load(cluster, key)
+    est = estimate_mem(
+        records,
+        safety=estimate_cfg.safety,
+        window=estimate_cfg.window,
+        min_samples=estimate_cfg.min_samples,
+        current_ask_mb=mem_mb if mem_mb > 0 else None,
+    )
+    next_est = f"{est.mem_mb}M" if est.mem_mb is not None else "<not enough samples>"
+    console.log(
+        f"job {job_id} {state}: asked {mem_mb}M, peak {peak}M "
+        f"(utilization {util}), next estimate {next_est}"
+    )
+    suggestion = format_suggestion(est)
+    if suggestion is not None:
+        console.log(f"suggest: {suggestion}")
 
 
 async def _watch_job_chain(
@@ -373,6 +426,7 @@ async def _watch_job_chain(
     initial_mem: str,
     retry: RetryConfig | None,
     write_back: bool,
+    estimate_cfg: EstimateConfig | None = None,
 ) -> int | None:
     """Watch a (possibly retrying) job chain to terminal state.
 
@@ -393,7 +447,12 @@ async def _watch_job_chain(
     while True:
         state = await _wait_terminal(remote, job_id)
         if write_back:
-            await _persist_terminal(remote, cluster, key, job_id, current_mem)
+            persisted = await _persist_terminal(remote, cluster, key, job_id, current_mem)
+            if estimate_cfg is not None:
+                p_state, p_mem, p_rss = persisted
+                _log_post_job_summary(
+                    cluster, key, job_id, p_state, p_mem, p_rss, estimate_cfg
+                )
         if retry is None or state != "OUT_OF_MEMORY":
             return job_id
         if hop >= max_hops:

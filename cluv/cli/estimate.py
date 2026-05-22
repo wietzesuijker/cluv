@@ -25,15 +25,17 @@ async def estimate(
     backfill: bool,
 ) -> None:
     """Show what `cluv submit` would predict for memory, without submitting anything."""
-    from salvo.history import estimate_mem, spec_key
+    from salvo.history import estimate_mem, format_suggestion, spec_key
 
     git_commit = ensure_clean_git_state()
     key = spec_key(str(job_script), git_commit, tuple(program_args))
 
-    cfg = get_config().estimate
+    cluv_config = get_config()
+    cfg = cluv_config.estimate
     safety = cfg.safety if cfg else 1.2
     window = cfg.window if cfg else 20
     min_samples = cfg.min_samples if cfg else 3
+    current_ask_mb = _current_sbatch_mem_mb(cluv_config, cluster)
 
     console.print(f"spec key: [bold]{key}[/bold]")
     console.print(f"cluster:  {cluster}")
@@ -75,7 +77,13 @@ async def estimate(
         )
     console.print(table)
 
-    est = estimate_mem(records, safety=safety, window=window, min_samples=min_samples)
+    est = estimate_mem(
+        records,
+        safety=safety,
+        window=window,
+        min_samples=min_samples,
+        current_ask_mb=current_ask_mb,
+    )
     console.print(f"\n[bold]estimate:[/bold] {est.rationale}")
     console.print(f"  confidence: {est.confidence}")
     console.print(f"  n_samples:  {est.n_samples}")
@@ -87,3 +95,23 @@ async def estimate(
         console.print("[yellow]→ SBATCH_MEM would be left untouched.[/yellow]")
     else:
         console.print(f"[green]→ SBATCH_MEM would be set to {est.mem_mb}M.[/green]")
+    suggestion = format_suggestion(est)
+    if suggestion is not None:
+        console.print(f"[cyan]suggest:[/cyan] {suggestion}")
+
+
+def _current_sbatch_mem_mb(cluv_config, cluster: str) -> int | None:
+    """Resolve the configured `SBATCH_MEM` for ``cluster`` as integer MiB.
+
+    Mirrors the merge order in ``cluv.cli.submit._initial_mem`` (global env then
+    per-cluster env). Returns None when nothing is configured or the value is
+    unparsable; the suggestion is silently skipped in that case.
+    """
+    from cluv.config import ClusterConfig
+    from cluv.history import parse_mem_to_mb
+
+    merged = {**cluv_config.env, **cluv_config.clusters.get(cluster, ClusterConfig()).env}
+    raw = merged.get("SBATCH_MEM")
+    if not raw:
+        return None
+    return parse_mem_to_mb(raw)
