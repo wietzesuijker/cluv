@@ -47,6 +47,7 @@ async def probe(
     one. The real estimator stays gated on the configured `min_samples`.
     """
     from salvo.history import (
+        DEGENERATE_RSS_RATIO,
         JobRecord,
         estimate_mem,
         format_suggestion,
@@ -126,6 +127,15 @@ async def probe(
 
     cfg = EstimateConfig(enabled=True)
     records = history.load(cluster, key)
+    # A probe deliberately asks far more than the workload needs, so the
+    # salvo degenerate-MaxRSS heuristic (which falls back to mem_mb when
+    # MaxRSS<5% of the ask) would over-state the projection. Skip the
+    # projection in that case and tell the user what really happened.
+    degenerate = (
+        max_rss is not None
+        and mem_mb > 0
+        and max_rss < mem_mb * DEGENERATE_RSS_RATIO
+    )
     est = estimate_mem(
         records,
         safety=cfg.safety,
@@ -135,6 +145,12 @@ async def probe(
     )
     if est.mem_mb is not None:
         console.log(f"estimator: {est.rationale} (confidence={est.confidence})")
+    elif degenerate:
+        console.log(
+            f"estimator: 1 sample cached, but MaxRSS={max_rss}M is implausibly "
+            f"small for a {mem_mb}M ask (cluster's sacct sampling likely missed "
+            "the peak). Submit a real run to get a usable measurement."
+        )
     else:
         projection = estimate_mem(
             records,
