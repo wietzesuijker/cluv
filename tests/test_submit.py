@@ -1237,6 +1237,7 @@ async def test_submit_races_the_allocations_of_a_cluster(
     )
     real_sleep = asyncio.sleep
     monkeypatch.setattr(asyncio, "sleep", lambda _: real_sleep(0))
+    monkeypatch.setattr(cluv.cli.submit.secrets, "token_hex", lambda _: "abcd1234")
 
     job_script = project_dir / "job.sh"
     job_script.write_text("#!/bin/bash\necho Hello World\n")
@@ -1298,12 +1299,75 @@ async def test_submit_races_the_allocations_of_a_cluster(
     assert returned_job.sbatch_args == {
         "time": "1:00:00",
         "account": "def-bengioy",
-        "job-name": "cluv-job",
+        # Both jobs of the race share a name, so that they can be found without their job ids.
+        "job-name": "cluv-job-abcd1234",
         "output": "results/narval_%j/slurm-%j.out",
         "chdir": "$HOME/my_project",
         "export": "ALL",
     }
     assert cancelled == [rrg_job_id]
+
+
+@pytest.mark.timeout(10)
+async def test_lost_connection_during_a_race_prints_how_to_cancel_its_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    project_dir: Path,
+    no_active_remotes,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When cluv loses the connection while it waits for a race, the jobs stay in the queue.
+
+    cluv cannot cancel them, so it prints the command that does.
+    """
+    cluster = "narval"
+    (project_dir / "pyproject.toml").write_text(
+        textwrap.dedent(
+            f"""\
+        [tool.cluv]
+        results_path = "results"
+        [tool.cluv.clusters.{cluster}]
+        sbatch_args = [{{ account = "rrg-bengioy-ad" }}, {{ account = "def-bengioy" }}]
+        """
+        )
+    )
+    current_cluster_mock = unittest.mock.Mock(spec=current_cluster, return_value=cluster)
+    monkeypatch.setattr(cluv.utils, current_cluster.__name__, current_cluster_mock)
+    monkeypatch.setattr(sync_module, current_cluster.__name__, current_cluster_mock)
+    monkeypatch.setattr(
+        cluv.cli.submit, ensure_clean_git_state.__name__, lambda **kwargs: "dummy_git_commit"
+    )
+    monkeypatch.setattr(cluv.cli.submit.secrets, "token_hex", lambda _: "abcd1234")
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda _: real_sleep(0))
+    job_script = project_dir / "job.sh"
+    job_script.write_text("#!/bin/bash\necho Hello World\n")
+    job_ids = iter([111, 222])
+
+    async def fake_run(program_and_args: tuple[str, ...], **kwargs):
+        full_command = shlex.join(program_and_args)
+        if "sbatch --parsable" in full_command:
+            assert "--job-name=cluv-job-abcd1234" in full_command
+            return subprocess.CompletedProcess(
+                program_and_args, returncode=0, stdout=str(next(job_ids)), stderr=""
+            )
+        if "sacct -j" in full_command:
+            raise subprocess.CalledProcessError(255, program_and_args, stderr="Broken pipe")
+        pytest.fail(f"Unexpected command: {full_command}")
+
+    run_name = cluv.remote.run.__name__
+    for module in (cluv.remote, cluv.slurm, cluv.cli.submit):
+        monkeypatch.setattr(module, run_name, unittest.mock.AsyncMock(wraps=fake_run))
+
+    with pytest.raises(subprocess.CalledProcessError):
+        await submit(
+            cluster=cluster,
+            job_script=job_script,
+            sbatch_args=[],
+            program_args=[],
+            _skip_sync=True,
+        )
+
+    assert "  scancel --me --name=cluv-job-abcd1234\n" in capsys.readouterr().err
 
 
 def _submitted_job(job_id: int, cluster: str = "narval") -> SubmissionProgress[Job]:

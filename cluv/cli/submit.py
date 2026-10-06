@@ -6,6 +6,7 @@ import itertools
 import logging
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -195,6 +196,15 @@ async def submit(
     )
     git_commit = ensure_clean_git_state(autocommit=autocommit, submit_command=submit_command)
     cluster_to_remote = await get_cluster_to_remote(cluster)
+    # The jobs of a race share a unique name, so that they can all be found (and cancelled) even
+    # when cluv stops before it knows their job ids.
+    cluv_config = get_cluv_config()
+    may_race = (
+        len(cluster_to_remote) > 1
+        or vram is not None
+        or any(len(cluv_config.get_cluster_config(c).sbatch_args) > 1 for c in cluster_to_remote)
+    )
+    race_id = secrets.token_hex(4) if may_race else None
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = get_submission_log_dir()
@@ -212,6 +222,7 @@ async def submit(
                 chunking=chunking,
                 vram=vram,
                 git_commit=git_commit,
+                race_id=race_id,
             )
             for cluster_name, remote in cluster_to_remote.items()
         }
@@ -286,6 +297,11 @@ async def submit(
         console.log("Interrupted by user. Cancelling all submitted jobs...")
         all_jobs = list(itertools.chain.from_iterable(cluster_to_job_submissions.values()))
         await run_scancel(all_jobs)
+        print_cancel_hint(cluster_to_job_submissions, cluster_to_remote, race_id)
+        raise
+    except Exception:
+        # Most likely a lost connection. The jobs of the race keep running without cluv.
+        print_cancel_hint(cluster_to_job_submissions, cluster_to_remote, race_id)
         raise
 
     job = winning_job.job
@@ -445,6 +461,27 @@ async def wait_for_jobs_to_cancel(
         )
 
 
+def print_cancel_hint(
+    cluster_to_job_submissions: dict[str, list[SubmissionProgress]],
+    cluster_to_remote: dict[str, Remote | None],
+    race_id: str | None,
+) -> None:
+    """Print the commands that cancel every job of a race that ended abnormally."""
+    if race_id is None:
+        return
+    print(
+        "The race ended before cluv could cancel the extra jobs. "
+        "To cancel any that are left (including the one you want to keep), run:",
+        file=sys.stderr,
+    )
+    for cluster, rows in cluster_to_job_submissions.items():
+        names = sorted({row.job.sbatch_args["job-name"] for row in rows})
+        scancel = f"scancel --me --name={','.join(names)}"
+        if cluster_to_remote.get(cluster) is not None:
+            scancel = f"ssh {cluster} {shlex.quote(scancel)}"
+        print(f"  {scancel}", file=sys.stderr)
+
+
 async def run_scancel(jobs: list[SubmissionProgress]) -> None:
     """Cancel the (already-submitted) jobs behind `rows`, grouped by remote."""
     if not jobs:
@@ -557,6 +594,7 @@ async def get_submissions(
     chunking: int | None,
     git_commit: str,
     vram: str | None = None,
+    race_id: str | None = None,
 ) -> list[Submission]:
     """Expand the possible job configurations for a cluster. Returns a list of `Submission` objects.
 
@@ -606,6 +644,7 @@ async def get_submissions(
                 job_script=job_script,
                 cluster=cluster,
                 cluster_config=cluster_config,
+                race_id=race_id,
             )
             sbatch_command = get_sbatch_command(
                 env_vars=job_env_vars,
@@ -716,10 +755,12 @@ def add_cluv_sbatch_args(
     job_script: Path,
     cluster: str,
     cluster_config: ClusterConfig,
+    race_id: str | None = None,
 ) -> SbatchArgs:
     """
     - Add the --output flag (So that outputs are created in the `results_path` for the run prescribed by Cluv)
-    - Add the --job-name flag (So that we can identify the cluv jobs later)
+    - Add the --job-name flag (So that we can identify the cluv jobs later), ending with `race_id`
+      if given, to find all the jobs of a race
     - Add the --export=ALL flag (since trillium and trillium-gpu apparently have `--export=None` as default).
     - Add the --chdir flag to move to the project folder when running the command.
 
@@ -728,7 +769,7 @@ def add_cluv_sbatch_args(
     sbatch_args = sbatch_args.copy()
 
     base_name = sbatch_args.get("job-name") or Path(job_script).stem
-    sbatch_args["job-name"] = f"cluv-{base_name}"
+    sbatch_args["job-name"] = f"cluv-{base_name}" + (f"-{race_id}" if race_id else "")
 
     if "output" not in sbatch_args and (
         _header_output := next(
