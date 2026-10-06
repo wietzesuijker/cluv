@@ -121,12 +121,12 @@ async def get_job_states_and_starts_with_sacct(
     for line in output.splitlines():
         job_id_str, _, rest = line.partition("|")
         state, _, start = rest.partition("|")
-        job_id_to_state[int(job_id_str)] = (state, _parse_start(start))
+        job_id_to_state[int(job_id_str)] = (state, parse_start(start))
     # `sacct` can lag a few seconds behind `sbatch`, so a job it doesn't list yet is pending.
     return [job_id_to_state.get(job_id, ("PENDING", None)) for job_id in jobs]
 
 
-def _parse_start(start: str) -> datetime | None:
+def parse_start(start: str) -> datetime | None:
     try:
         return parse_timestamp(start)
     except ValueError:  # `Unknown`, `None`, or missing.

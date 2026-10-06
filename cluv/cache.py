@@ -244,6 +244,15 @@ def _get_cached_jobs_path() -> Path:
     return _get_cache_dir() / "jobs.jsonl"
 
 
+def get_races_journal_path() -> Path:
+    """The journal of the races of `cluv submit` (see `cluv/cli/submit_utils/race.py`).
+
+    Kept apart from `jobs.jsonl`, since `load_jobs` drops (and rewrites away) any record that
+    isn't a `Job`.
+    """
+    return _get_cache_dir() / "races.jsonl"
+
+
 def get_submission_log_dir() -> Path:
     """Directory where per-submission `sbatch` logs are written (see `cli/submit.py`), so a
     failure buried in interleaved multi-cluster/multi-submission console output can still be

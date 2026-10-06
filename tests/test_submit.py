@@ -14,7 +14,9 @@ import pytest
 import cluv.__main__ as cluv_main
 import cluv.cli.init
 import cluv.cli.submit
+import cluv.cache
 import cluv.cli.submit_utils
+import cluv.cli.submit_utils.race
 import cluv.cli.submit_utils.vram
 import cluv.remote
 import cluv.slurm
@@ -1282,10 +1284,13 @@ async def test_submit_races_the_allocations_of_a_cluster(
         if full_command == f"scancel {rrg_job_id}":
             cancelled.append(rrg_job_id)
             return _result("")
+        if "--name=cluv-job-" in full_command:
+            return _result("")  # Looking for racers we lost track of: there are none.
         pytest.fail(f"Unexpected command: {full_command}")
 
+    monkeypatch.setattr(cluv.cache, cluv.cache._get_cache_dir.__name__, lambda: project_dir)
     run_name = cluv.remote.run.__name__
-    for module in (cluv.remote, cluv.slurm, cluv.cli.submit):
+    for module in (cluv.remote, cluv.slurm, cluv.cli.submit, cluv.cli.submit_utils.race):
         monkeypatch.setattr(module, run_name, unittest.mock.AsyncMock(wraps=fake_run))
 
     returned_job = await submit(
@@ -1295,10 +1300,12 @@ async def test_submit_races_the_allocations_of_a_cluster(
     assert returned_job
     assert returned_job.job_id == def_job_id
     # The allocation that was used is saved with the job, along with the flags cluv adds to it.
+    (race,) = cluv.cli.submit_utils.race.load_races().values()
+    assert race.resolved
     assert returned_job.sbatch_args == {
         "time": "1:00:00",
         "account": "def-bengioy",
-        "job-name": "cluv-job",
+        "job-name": f"cluv-job-{race.id}",
         "output": "results/narval_%j/slurm-%j.out",
         "chdir": "$HOME/my_project",
         "export": "ALL",
@@ -1490,6 +1497,8 @@ async def test_submit_first_considers_current_cluster(
         if not runs_first_on_current_cluster and full_command == f"scancel {this_cluster_jobid}":
             scancel_received_on_this_cluster = True
             return _result("")
+        if "--name=cluv-my_script-" in full_command:
+            return _result("")  # Looking for racers we lost track of: there are none.
         print(*run_commands, sep="\n")
         pytest.fail(f"Unexpected command: {full_command}, {runs_first_on_current_cluster=}")
 
@@ -1504,6 +1513,12 @@ async def test_submit_first_considers_current_cluster(
         cluv.cli.submit.run.__name__,
         _mock := unittest.mock.AsyncMock(wraps=fake_run),
     )
+    monkeypatch.setattr(
+        cluv.cli.submit_utils.race,
+        cluv.cli.submit_utils.race.run.__name__,
+        _mock := unittest.mock.AsyncMock(wraps=fake_run),
+    )
+    monkeypatch.setattr(cluv.cache, cluv.cache._get_cache_dir.__name__, lambda: cluv_project_dir)
 
     # Make `get_active_remotes()` return a Remote that is not for the current cluster, instead
     # of trying to connect for real.

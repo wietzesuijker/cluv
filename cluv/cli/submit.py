@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
+import functools
 import itertools
 import logging
 import os
@@ -22,6 +23,14 @@ from rich.live import Live
 
 from cluv.cache import Job, Submission, get_submission_log_dir, save_job
 from cluv.cli.submit_utils.chunking import apply_chunking
+from cluv.cli.submit_utils.race import (
+    TRANSIENT_ERRORS,
+    Race,
+    by_start,
+    converge,
+    new_race_id,
+    retrying,
+)
 from cluv.cli.submit_utils.vram import expand_for_vram
 from cluv.cli.sync import (
     get_cluster_to_remote,
@@ -196,6 +205,16 @@ async def submit(
     git_commit = ensure_clean_git_state(autocommit=autocommit, submit_command=submit_command)
     cluster_to_remote = await get_cluster_to_remote(cluster)
 
+    # Give the jobs of a race a common job name suffix, to be able to find them all on the clusters,
+    # even the ones whose job id we lose track of.
+    cluv_config = get_cluv_config()
+    may_race = (
+        len(cluster_to_remote) > 1
+        or vram is not None
+        or any(len(cluv_config.get_cluster_config(c).sbatch_args) > 1 for c in cluster_to_remote)
+    )
+    race_id = new_race_id() if may_race else None
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = get_submission_log_dir()
 
@@ -212,6 +231,7 @@ async def submit(
                 chunking=chunking,
                 vram=vram,
                 git_commit=git_commit,
+                race_id=race_id,
             )
             for cluster_name, remote in cluster_to_remote.items()
         }
@@ -242,6 +262,17 @@ async def submit(
         with logging_commands_to(all_log_paths):
             await sync_common_part(remotes, sync_datasets=sync_datasets)
 
+    # Write the race down before running any `sbatch`, so that it can be cleaned up after a crash.
+    race = None
+    if race_id is not None:
+        race = Race.start(
+            race_id,
+            job_names={
+                cluster_name: sorted({str(row.job.sbatch_args["job-name"]) for row in rows})
+                for cluster_name, rows in cluster_to_job_submissions.items()
+            },
+        )
+
     found_running_job = asyncio.Event()
 
     cancelling = False
@@ -257,10 +288,19 @@ async def submit(
                 found_running_job=found_running_job,
                 _skip_sync=_skip_sync,
                 sync_datasets=sync_datasets,
+                race=race,
             )
             if winning_job is None:
                 console.log("All job submissions have failed! Exiting.")
+                # A job whose `sbatch` ran but whose job id never made it back is kept, if any.
+                if race and (kept := await converge(race, cluster_to_remote, winner=None)):
+                    console.log(
+                        f"Job {kept[1]} on {kept[0]} was submitted even though its submission "
+                        f"failed. Keeping it."
+                    )
                 return None
+            if race:
+                race.record_winner((winning_job.cluster, winning_job.job.job_id))
 
             for _cluster, cluster_jobs in cluster_to_job_submissions.items():
                 for job in cluster_jobs:
@@ -280,13 +320,25 @@ async def submit(
                 for job in jobs_to_cancel:
                     console.log(f"  {job.job_id} on {job.cluster}")
             await wait_for_jobs_to_cancel(jobs_to_cancel, cluster_to_remote)
+            if race:
+                # Also cancels the jobs whose job id we lost track of.
+                await converge(race, cluster_to_remote, winner=race.winner)
             live.refresh()
     except (KeyboardInterrupt, asyncio.CancelledError):
         # The user stopped `cluv submit` while jobs were still in flight -- cancel everything.
         console.log("Interrupted by user. Cancelling all submitted jobs...")
+        if race:
+            race.record_cancel_all()
         all_jobs = list(itertools.chain.from_iterable(cluster_to_job_submissions.values()))
         await run_scancel(all_jobs)
         raise
+    except TRANSIENT_ERRORS as err:
+        # A cluster stayed unreachable, even after retrying. Don't leave jobs behind silently.
+        if race is None:
+            raise
+        console.print(f"Lost the connection to a cluster during the race: {err}", style="red")
+        console.print(race.recovery_hint(cluster_to_remote))
+        sys.exit(1)
 
     job = winning_job.job
     assert job is not None
@@ -312,6 +364,7 @@ async def wait_for_first_running_job(
     found_running_job: asyncio.Event,
     _skip_sync: bool,
     sync_datasets: bool,
+    race: Race | None = None,
     initial_delay: int = 10,
     max_wait_time_seconds: int = 30,
 ) -> SubmissionProgress[Job] | None:
@@ -337,6 +390,7 @@ async def wait_for_first_running_job(
                 found_running_job=found_running_job,
                 _skip_sync=_skip_sync,
                 sync_datasets=sync_datasets,
+                race=race,
             )
             for cluster_name, cluster_job_submissions in cluster_to_job_submissions.items()
         ),
@@ -351,7 +405,12 @@ async def wait_for_first_running_job(
 
             await asyncio.gather(
                 *(
-                    update_job_states_with_sacct(cluster_to_remote[cluster], cluster_jobs)
+                    retrying(
+                        functools.partial(
+                            update_job_states_with_sacct, cluster_to_remote[cluster], cluster_jobs
+                        ),
+                        what=f"Checking the state of the jobs on {cluster}",
+                    )
                     for cluster, cluster_jobs in group_by_cluster(queued_jobs).items()
                 )
             )
@@ -364,7 +423,7 @@ async def wait_for_first_running_job(
                 found_running_job.set()
                 logger.debug(f"Found {len(started_jobs)} running (or completed) jobs.")
                 # Keep the job that started first: it has made the most progress.
-                return min(started_jobs, key=_start_sort_key)
+                return min(started_jobs, key=by_start)
 
             if submitted_everywhere:
                 if all(j.state.startswith(tuple(FAILED_JOB_STATES)) for j in queued_jobs):
@@ -399,11 +458,6 @@ async def update_job_states_with_sacct(
         job.start = start
 
 
-def _start_sort_key(job: SubmissionProgress) -> tuple[bool, datetime.datetime]:
-    """Sort jobs by start time, with jobs of unknown start time last."""
-    return (job.start is None, job.start or datetime.datetime.max.replace(tzinfo=datetime.UTC))
-
-
 async def wait_for_jobs_to_cancel(
     job_submissions: list[SubmissionProgress[Job]],
     cluster_to_remote: dict[str, Remote | None],
@@ -426,11 +480,14 @@ async def wait_for_jobs_to_cancel(
                 await run_scancel([job])
             except Exception as err:
                 logging.debug(f"Error running scancel for job {job.job_id}: {err}")
-        job_states = await gather_dict(
-            {
-                cluster: get_job_states_with_sacct(cluster_to_remote[cluster], cluster_job_ids)
-                for cluster, cluster_job_ids in cluster_to_job_ids.items()
-            }
+        job_states = await retrying(
+            lambda: gather_dict(
+                {
+                    cluster: get_job_states_with_sacct(cluster_to_remote[cluster], cluster_job_ids)
+                    for cluster, cluster_job_ids in cluster_to_job_ids.items()
+                }
+            ),
+            what="Checking that the jobs are cancelled",
         )
         for cluster, cluster_jobs in cluster_to_job_submissions.items():
             for job, state in zip(cluster_jobs, job_states[cluster]):
@@ -479,6 +536,7 @@ async def sync_and_submit_jobs_to_cluster(
     found_running_job: asyncio.Event,
     _skip_sync: bool = False,
     sync_datasets: bool = True,
+    race: Race | None = None,
 ) -> list[SubmissionProgress[Job]]:
     """Sync then submit every submission for one cluster, in parallel.
 
@@ -522,6 +580,8 @@ async def sync_and_submit_jobs_to_cluster(
 
     for job_submission in job_submissions:
         job_submission.state = "SUBMITTING"
+    if race:
+        race.record_sbatch(cluster)
 
     results = await asyncio.gather(
         *(submit_job(row.job, row.log_path) for row in job_submissions),
@@ -532,6 +592,8 @@ async def sync_and_submit_jobs_to_cluster(
     successful_job_submissions: list[SubmissionProgress[Job]] = []
     for job_submission, result in zip(job_submissions, results):
         if isinstance(result, Job):
+            if race:
+                race.record_job(cluster, result.job_id)
             job_submission.job = result
             job_submission.state = "PENDING"
             assert has_job(job_submission)
@@ -557,6 +619,7 @@ async def get_submissions(
     chunking: int | None,
     git_commit: str,
     vram: str | None = None,
+    race_id: str | None = None,
 ) -> list[Submission]:
     """Expand the possible job configurations for a cluster. Returns a list of `Submission` objects.
 
@@ -606,6 +669,7 @@ async def get_submissions(
                 job_script=job_script,
                 cluster=cluster,
                 cluster_config=cluster_config,
+                race_id=race_id,
             )
             sbatch_command = get_sbatch_command(
                 env_vars=job_env_vars,
@@ -716,10 +780,12 @@ def add_cluv_sbatch_args(
     job_script: Path,
     cluster: str,
     cluster_config: ClusterConfig,
+    race_id: str | None = None,
 ) -> SbatchArgs:
     """
     - Add the --output flag (So that outputs are created in the `results_path` for the run prescribed by Cluv)
-    - Add the --job-name flag (So that we can identify the cluv jobs later)
+    - Add the --job-name flag (So that we can identify the cluv jobs later), ending with the
+      `race_id` if given, to find all the jobs of a race (see `cluv.cli.submit_utils.race`).
     - Add the --export=ALL flag (since trillium and trillium-gpu apparently have `--export=None` as default).
     - Add the --chdir flag to move to the project folder when running the command.
 
@@ -728,7 +794,7 @@ def add_cluv_sbatch_args(
     sbatch_args = sbatch_args.copy()
 
     base_name = sbatch_args.get("job-name") or Path(job_script).stem
-    sbatch_args["job-name"] = f"cluv-{base_name}"
+    sbatch_args["job-name"] = f"cluv-{base_name}" + (f"-{race_id}" if race_id else "")
 
     if "output" not in sbatch_args and (
         _header_output := next(
