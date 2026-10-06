@@ -1201,10 +1201,16 @@ async def test_submit_cancels_in_flight_jobs_when_interrupted(
     assert [row.job_id for row in cancelled_rows] == [jobid]
 
 
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("rrg_job_starts", [False, True], ids=["rrg_pending", "rrg_started_later"])
 async def test_submit_races_the_allocations_of_a_cluster(
-    monkeypatch: pytest.MonkeyPatch, project_dir: Path, no_active_remotes
+    monkeypatch: pytest.MonkeyPatch, project_dir: Path, no_active_remotes, rrg_job_starts: bool
 ) -> None:
-    """A cluster with two allocations gets one job per allocation, and the loser is cancelled."""
+    """A cluster with two allocations gets one job per allocation, and the loser is cancelled.
+
+    When both jobs have started by the time `sacct` is checked, the one that started first wins,
+    even though it is listed last.
+    """
     cluster = "narval"
     (project_dir / "pyproject.toml").write_text(
         textwrap.dedent(
@@ -1231,8 +1237,10 @@ async def test_submit_races_the_allocations_of_a_cluster(
     job_script = project_dir / "job.sh"
     job_script.write_text("#!/bin/bash\necho Hello World\n")
 
-    # The job of the `def-` allocation starts right away; the `rrg-` one stays pending.
+    # The job of the `def-` allocation starts right away; the `rrg-` one stays pending, or
+    # starts a bit later.
     rrg_job_id, def_job_id = 111, 222
+    rrg_state = "RUNNING|2026-01-01T00:00:10" if rrg_job_starts else "PENDING|Unknown"
     cancelled: list[int] = []
 
     async def fake_run(program_and_args: tuple[str, ...], **kwargs):
@@ -1259,11 +1267,13 @@ async def test_submit_races_the_allocations_of_a_cluster(
             for job_id in ids:
                 if job_id == rrg_job_id:
                     states.append(
-                        f"{job_id}|CANCELLED" if rrg_job_id in cancelled else f"{job_id}|PENDING"
+                        f"{job_id}|CANCELLED"
+                        if rrg_job_id in cancelled
+                        else f"{job_id}|{rrg_state}"
                     )
                 else:
                     assert job_id == def_job_id
-                    states.append(f"{job_id}|RUNNING")
+                    states.append(f"{job_id}|RUNNING|2026-01-01T00:00:00")
             return _result("\n".join(states))
         if full_command == f"scancel {rrg_job_id}":
             cancelled.append(rrg_job_id)
