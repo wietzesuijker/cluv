@@ -5,6 +5,7 @@ any point, to check that no racer is left behind.
 """
 
 import asyncio
+import copy
 import datetime
 import importlib
 import re
@@ -22,7 +23,7 @@ import cluv.cli.submit_utils.race
 import cluv.remote
 import cluv.slurm
 import cluv.utils
-from cluv.cli.submit import ensure_clean_git_state, submit
+from cluv.cli.submit import ensure_clean_git_state, resume_races, submit
 from cluv.cli.submit_utils.race import Race, load_races, retrying
 from cluv.utils import console, current_cluster
 
@@ -37,7 +38,9 @@ START = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
 class FakeSlurm:
     """A fake Slurm cluster, reached through `cluv.remote.run`, whose connection can drop."""
 
-    def __init__(self) -> None:
+    def __init__(self, current_cluster: unittest.mock.Mock) -> None:
+        self.current_cluster = current_cluster
+        """Make this return None to submit from (or resume on) a machine with no connection."""
         self.jobs: dict[int, dict] = {}
         self.connected = True
         self.drop_on: str | None = None
@@ -134,7 +137,7 @@ def slurm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSlurm:
     real_sleep = asyncio.sleep
     monkeypatch.setattr(asyncio, "sleep", lambda _: real_sleep(0))
 
-    fake = FakeSlurm()
+    fake = FakeSlurm(current_cluster_mock)
     for module in (cluv.remote, cluv.slurm, cluv.cli.submit, cluv.cli.submit_utils.race):
         monkeypatch.setattr(module, cluv.remote.run.__name__, fake.run)
     return fake
@@ -191,6 +194,64 @@ async def test_connection_lost_while_polling_leaves_the_race_open(slurm: FakeSlu
     assert sorted(race.job_ids[CLUSTER]) == sorted(slurm.jobs)
     assert len(slurm.alive()) == 2  # Nothing could be cancelled.
     assert f"scancel --me --name=cluv-job-{race.id}" in capture.get()
+
+
+@pytest.mark.parametrize(
+    ("drop_on", "sbatch_runs", "jobs_left"),
+    [
+        pytest.param("sbatch --parsable", False, 0, id="before_sbatch"),
+        pytest.param("--account=rrg-bengioy-ad", True, 1, id="after_sbatch_before_job_id"),
+        pytest.param("sacct -j", False, 1, id="while_polling"),
+        pytest.param("scancel", False, 1, id="while_cancelling"),
+    ],
+)
+async def test_resume_after_connection_loss(
+    slurm: FakeSlurm, drop_on: str, sbatch_runs: bool, jobs_left: int
+) -> None:
+    slurm.drop_on = drop_on
+    slurm.sbatch_runs_while_dropping = sbatch_runs
+    with pytest.raises(SystemExit) as exc_info:
+        await cluv_submit()
+    assert exc_info.value.code == 1
+    assert slurm.drop_on is None  # The connection was lost at that point.
+    assert not only_race().resolved
+
+    slurm.connected = True
+    await resume_races()
+
+    race = only_race()
+    assert race.resolved
+    assert len(slurm.alive()) == jobs_left
+    if jobs_left:
+        assert race.winner == (CLUSTER, slurm.alive()[0])
+
+    # Resuming again changes nothing.
+    jobs = copy.deepcopy(slurm.jobs)
+    journal = cluv.cache.get_races_journal_path().read_text()
+    await resume_races()
+    assert slurm.jobs == jobs
+    assert cluv.cache.get_races_journal_path().read_text() == journal
+
+
+async def test_resume_leaves_the_races_on_disconnected_clusters_open(slurm: FakeSlurm) -> None:
+    slurm.drop_on = "sacct -j"
+    with pytest.raises(SystemExit):
+        await cluv_submit()
+    slurm.connected = True
+
+    # Not on the cluster anymore, and not connected to it: nothing to do but wait.
+    slurm.current_cluster.return_value = None
+    with console.capture() as capture, pytest.raises(SystemExit) as exc_info:
+        await resume_races()
+    assert exc_info.value.code == 1
+    assert f"cluv login {CLUSTER}" in " ".join(capture.get().split())  # Undo the line wrapping.
+    assert not only_race().resolved
+    assert len(slurm.alive()) == 2
+
+    slurm.current_cluster.return_value = CLUSTER
+    await resume_races()
+    assert only_race().resolved
+    assert len(slurm.alive()) == 1
 
 
 async def test_retrying_recovers_from_a_transient_error() -> None:

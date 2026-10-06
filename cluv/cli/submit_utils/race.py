@@ -132,6 +132,7 @@ class Race:
             scancel = f"scancel --me --name={','.join(self.job_names[cluster])}"
             local = cluster in cluster_to_remote and cluster_to_remote[cluster] is None
             lines.append(f"  {scancel}" if local else f"  ssh {cluster} {shlex.quote(scancel)}")
+        lines.append("Or, to keep one of them and cancel the others: `cluv submit --resume`")
         return "\n".join(lines)
 
 

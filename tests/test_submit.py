@@ -727,6 +727,34 @@ class TestSubmitCliParsing:
             }
         )
 
+    def test_resume_doesnt_submit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            cluv_main, "submit", mock_submit := mock.AsyncMock(spec=cluv_main.submit)
+        )
+        monkeypatch.setattr(
+            cluv_main,
+            "resume_races",
+            mock_resume := mock.AsyncMock(spec=cluv_main.resume_races),
+        )
+
+        cluv_main.main(["submit", "--resume"])
+
+        mock_resume.assert_called_once_with()
+        mock_submit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "argv", [["submit"], ["submit", "--resume", "tamia"], ["submit", "tamia", "--resume"]]
+    )
+    def test_cluster_is_required_unless_resuming(
+        self, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+    ) -> None:
+        monkeypatch.setattr(
+            cluv_main, "submit", mock_submit := mock.AsyncMock(spec=cluv_main.submit)
+        )
+        with pytest.raises(SystemExit):
+            cluv_main.main(argv)
+        mock_submit.assert_not_called()
+
 
 async def test_failed_sync_commands_are_logged(tmp_path: Path) -> None:
     log_path = tmp_path / "log.txt"

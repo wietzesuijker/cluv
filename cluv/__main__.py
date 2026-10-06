@@ -28,7 +28,7 @@ from .cli.login import login
 from .cli.run import run
 from .cli.sh import sh
 from .cli.status import status
-from .cli.submit import submit
+from .cli.submit import resume_races, submit
 from .cli.submit_utils.chunking import CHUNK_SIZE
 from .cli.sync import sync
 from .utils import console
@@ -152,6 +152,13 @@ def main(argv: list[str] | None = None) -> None:
             args_dict["sbatch_args"] = remaining_sbatch_args
         args_dict["program_args"] = submit_program_args
 
+        if args_dict.pop("resume"):
+            if args_dict["cluster"] or args_dict["job_script"] or args_dict["sbatch_args"]:
+                submit_parser.error("--resume doesn't take a cluster, job script or sbatch args.")
+            function, args_dict = resume_races, {}
+        elif args_dict["cluster"] is None:
+            submit_parser.error("the following arguments are required: <cluster>")
+
     if subcommand == "status" and quiet:
         console.print("Warning: --quiet has no effect with the 'status' command.", style="yellow")
         quiet = False
@@ -180,11 +187,16 @@ def add_submit_args(subparsers: Subparsers):
         "submit",
         help="Submit a SLURM job on a remote cluster.",
         formatter_class=rich_argparse.RichHelpFormatter,
-        usage="cluv submit <cluster> [<job.sh>] [sbatch-args...] [-- program-args...]",
+        usage=(
+            "cluv submit <cluster> [<job.sh>] [sbatch-args...] [-- program-args...]\n"
+            "       cluv submit --resume"
+        ),
     )
     submit_parser.add_argument(
         "cluster",
         metavar="<cluster>",
+        nargs="?",
+        default=None,
         help=(
             "The cluster to submit the job on. "
             "Set at 'first' to submit a job on all clusters, and wait until one of them starts. "
@@ -244,6 +256,15 @@ def add_submit_args(subparsers: Subparsers):
         help=(
             "Output only the job ID (or '<cluster>:<job_id>' when cluster is 'first'), "
             "for programmatic use."
+        ),
+    )
+    submit_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Instead of submitting a job, finish the races that an interrupted `cluv submit` left "
+            "open: keep one job per race and cancel the others, on the clusters that are still "
+            "connected."
         ),
     )
     submit_parser.add_argument(

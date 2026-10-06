@@ -28,6 +28,7 @@ from cluv.cli.submit_utils.race import (
     Race,
     by_start,
     converge,
+    load_races,
     new_race_id,
     retrying,
 )
@@ -355,6 +356,44 @@ async def submit(
 
     save_job(job)
     return job
+
+
+async def resume_races() -> None:
+    """Finish the races left open by an interrupted `cluv submit` (`cluv submit --resume`).
+
+    For each open race, keeps one job (or none if the race was interrupted, or if every job
+    failed) and cancels the others, then marks the race as resolved. This is safe to run any
+    number of times. Races with jobs on a cluster we aren't connected to are left open: this
+    never logs in to a cluster.
+    """
+    open_races = [race for race in load_races().values() if not race.resolved]
+    if not open_races:
+        console.print("No open race to resume.")
+        return
+    cluster_to_remote = await get_cluster_to_remote("first")  # Only the connected clusters.
+    all_resolved = True
+    for race in open_races:
+        if missing := [c for c in race.sbatched if c not in cluster_to_remote]:
+            console.print(
+                f"Race {race.id} has jobs on {', '.join(missing)}, which isn't connected. Use "
+                f"`cluv login {' '.join(missing)}`, then `cluv submit --resume` again.",
+                style="yellow",
+            )
+            all_resolved = False
+            continue
+        try:
+            kept = await converge(race, cluster_to_remote, winner=None)
+        except TRANSIENT_ERRORS as err:
+            console.print(f"Could not reach a cluster of race {race.id}: {err}", style="red")
+            console.print(race.recovery_hint(cluster_to_remote))
+            all_resolved = False
+            continue
+        if kept:
+            console.print(f"Race {race.id}: kept job {kept[1]} on {kept[0]}.", style="green")
+        else:
+            console.print(f"Race {race.id}: no job left.", style="green")
+    if not all_resolved:
+        sys.exit(1)
 
 
 async def wait_for_first_running_job(
