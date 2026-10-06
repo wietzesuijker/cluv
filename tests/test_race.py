@@ -25,6 +25,7 @@ import cluv.slurm
 import cluv.utils
 from cluv.cli.submit import ensure_clean_git_state, resume_races, submit
 from cluv.cli.submit_utils.race import Race, load_races, retrying
+from cluv.slurm import TERMINAL_JOB_STATES
 from cluv.utils import console, current_cluster
 
 pytestmark = pytest.mark.timeout(10)
@@ -49,6 +50,8 @@ class FakeSlurm:
         """Whether the `sbatch` that drops the connection still submits its job."""
         self.blip = False
         """Whether the connection comes back right after the command that dropped it."""
+        self.states: list[str] = []
+        """The states that the next submitted jobs are in right away (RUNNING by default)."""
 
     def alive(self) -> list[int]:
         return [i for i, job in self.jobs.items() if job["state"] in ("PENDING", "RUNNING")]
@@ -75,7 +78,8 @@ class FakeSlurm:
         assert name
         # Jobs start right away, in the order in which they were submitted.
         start = START + datetime.timedelta(seconds=len(self.jobs))
-        self.jobs[job_id] = {"name": name.group(1), "state": "RUNNING", "start": start}
+        state = self.states.pop(0) if self.states else "RUNNING"
+        self.jobs[job_id] = {"name": name.group(1), "state": state, "start": start}
         return job_id
 
     def _row(self, job_id: int) -> str:
@@ -166,6 +170,24 @@ async def test_race_without_connection_loss(slurm: FakeSlurm) -> None:
     assert race.resolved
     assert race.winner == (CLUSTER, job.job_id)
     assert job.sbatch_args["job-name"] == f"cluv-job-{race.id}"
+
+
+@pytest.mark.parametrize("state", [s for s in TERMINAL_JOB_STATES if s != "COMPLETED"])
+async def test_race_ends_when_every_job_failed(slurm: FakeSlurm, state: str) -> None:
+    slurm.states = [state, state]
+    assert await cluv_submit() is None
+    assert only_race().resolved
+
+
+@pytest.mark.parametrize("state", TERMINAL_JOB_STATES)
+async def test_losing_job_that_already_ended_is_not_waited_for(
+    slurm: FakeSlurm, state: str
+) -> None:
+    # The first job ends before the second one starts, so the second one has to be waited for.
+    slurm.states = [state, "RUNNING"]
+    job = await cluv_submit()
+    assert job is not None
+    assert only_race().resolved
 
 
 async def test_job_whose_id_was_lost_is_cancelled(slurm: FakeSlurm) -> None:

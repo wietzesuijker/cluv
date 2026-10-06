@@ -29,7 +29,7 @@ from typing import Protocol, TypeVar
 
 from cluv.cache import get_races_journal_path
 from cluv.remote import Remote, run
-from cluv.slurm import parse_start
+from cluv.slurm import TERMINAL_JOB_STATES, parse_start
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,6 @@ T = TypeVar("T")
 TRANSIENT_ERRORS = (subprocess.CalledProcessError, OSError)
 """Errors of remote commands that can go away when retried, like a dropped SSH connection (`ssh`
 exits with 255) or `slurmdbd` being briefly unreachable."""
-
-LIVE_JOB_STATES = ("PENDING", "RUNNING", "CONFIGURING", "REQUEUED", "RESIZING", "SUSPENDED")
 
 
 class _HasStart(Protocol):
@@ -202,7 +200,7 @@ class RacerState:
 
     @property
     def live(self) -> bool:
-        return self.state.startswith(LIVE_JOB_STATES)
+        return not self.state.startswith(tuple(TERMINAL_JOB_STATES))
 
 
 async def find_racers(race: Race, cluster: str, remote: Remote | None) -> list[RacerState]:
