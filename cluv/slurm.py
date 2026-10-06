@@ -12,7 +12,13 @@ from datetime import datetime, timedelta, timezone
 
 from cluv.remote import Remote, run
 
-FAILED_JOB_STATES = ["FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"]
+FAILED_JOB_STATES = [
+    "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL",
+    "DEADLINE", "REVOKED", "SPECIAL_EXIT",
+]  # fmt: skip
+"""The states of a job that ended without succeeding."""
+TERMINAL_JOB_STATES = ["COMPLETED", *FAILED_JOB_STATES]
+"""The states of a job that ended. In any other state (even one we don't know of), it may still run."""
 
 
 @dataclass

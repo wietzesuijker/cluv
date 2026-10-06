@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import importlib
 import shlex
 import subprocess
@@ -32,8 +33,10 @@ from cluv.cli.submit import (
     submit,
     sync_and_submit_jobs_to_cluster,
     wait_for_first_running_job,
+    wait_for_jobs_to_cancel,
 )
 from cluv.cli.submit_utils.chunking import CHUNK_SIZE, apply_chunking
+from cluv.cache import Job
 from cluv.config import (
     CluvConfig,
     PartialClusterConfig,
@@ -42,6 +45,7 @@ from cluv.config import (
 )
 from cluv.remote import Remote
 from cluv.sbatch_args import SbatchArgs
+from cluv.slurm import FAILED_JOB_STATES, TERMINAL_JOB_STATES
 from cluv.utils import console, current_cluster
 
 # `cluv/cli/__init__.py` does `from .sync import sync`, which overwrites the `sync` attribute of
@@ -1300,6 +1304,76 @@ async def test_submit_races_the_allocations_of_a_cluster(
         "export": "ALL",
     }
     assert cancelled == [rrg_job_id]
+
+
+def _submitted_job(job_id: int, cluster: str = "narval") -> SubmissionProgress[Job]:
+    job = Job(
+        cluster=cluster,
+        remote=None,
+        job_script=Path("job.sh"),
+        sbatch_args={},
+        program_args=[],
+        sbatch_command="sbatch job.sh",
+        n_chunks=None,
+        git_commit="dummy_git_commit",
+        job_id=job_id,
+        submitted_at=datetime.datetime.now(datetime.UTC),
+    )
+    return SubmissionProgress(job=job, log_path=Path("job.log"), state="PENDING")
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda _: real_sleep(0))
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("state", FAILED_JOB_STATES)
+async def test_race_ends_when_every_job_ended_in_a_failed_state(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: None, state: str
+) -> None:
+    """Racers that all ended unsuccessfully (in any way) must not be polled forever."""
+    submissions = [_submitted_job(111), _submitted_job(222)]
+
+    async def fake_sync_and_submit(*args, **kwargs):
+        return []
+
+    async def fake_sacct(remote, job_ids):
+        return [(state, None) for _ in job_ids]
+
+    monkeypatch.setattr(cluv.cli.submit, "sync_and_submit_jobs_to_cluster", fake_sync_and_submit)
+    monkeypatch.setattr(cluv.cli.submit, "get_job_states_and_starts_with_sacct", fake_sacct)
+
+    winner = await wait_for_first_running_job(
+        {"narval": submissions},
+        cluster_to_remote={"narval": None},
+        found_running_job=asyncio.Event(),
+        _skip_sync=True,
+        sync_datasets=False,
+    )
+    assert winner is None
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("state", TERMINAL_JOB_STATES)
+async def test_losing_job_that_already_ended_is_not_waited_for(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: None, state: str
+) -> None:
+    """A loser that already ended (in any terminal state) can't be cancelled, so don't wait for it."""
+    loser = _submitted_job(111)
+
+    async def fake_scancel(jobs):
+        pass
+
+    async def fake_sacct(remote, job_ids):
+        return [state for _ in job_ids]
+
+    monkeypatch.setattr(cluv.cli.submit, "run_scancel", fake_scancel)
+    monkeypatch.setattr(cluv.cli.submit, "get_job_states_with_sacct", fake_sacct)
+
+    await wait_for_jobs_to_cancel([loser], {"narval": None})
+    assert loser.state == state
 
 
 @pytest.fixture()
