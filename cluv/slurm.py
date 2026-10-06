@@ -105,7 +105,8 @@ async def get_job_states_with_sacct(remote: Remote | None, jobs: list[int]) -> l
     for line in output.splitlines():
         job_id_str, _, state = line.partition("|")
         job_id_to_state[int(job_id_str)] = state
-    return [job_id_to_state[job_id] for job_id in jobs]
+    # `sacct` can lag a few seconds behind `sbatch`, so a job it doesn't list yet is pending.
+    return [job_id_to_state.get(job_id, "PENDING") for job_id in jobs]
 
 
 async def run_sacct(
