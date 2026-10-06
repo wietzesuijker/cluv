@@ -790,8 +790,11 @@ def get_sbatch_command(
     # itself to expand. That only holds together because the whole inner command is quoted in one
     # go below - `shlex.join`'s quotes would otherwise close a hand-written `'...'` around it, and
     # an argument containing a space would break apart (POSIX single quotes don't nest).
+    # `export` is required: with a bare `K=V K2=V2; sbatch ...` the assignments are plain shell
+    # variables that the `sbatch` child process never sees, so `--export=ALL` (which only forwards
+    # the exported environment) would carry none of them, `GIT_COMMIT` included.
     if env_vars_prefix:
-        env_vars_prefix += "; "
+        env_vars_prefix = f"export {env_vars_prefix}; "
     cd_command = ""
     if project_dir_on_cluster:
         cd_command = f"cd {project_dir_on_cluster} && "

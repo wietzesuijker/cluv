@@ -1,11 +1,12 @@
 import asyncio
 import importlib
 import shlex
+import shutil
 import subprocess
 import textwrap
 import unittest
 import unittest.mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 import pytest
@@ -239,7 +240,7 @@ class TestGetSbatchCommand:
         job_script_relative_path = sbatch_script.relative_to(fake_home)
 
         assert sbatch_command == (
-            "bash --login -c 'MY_VAR=1 SPECIAL_MILA_VAR=xyz "
+            "bash --login -c 'export MY_VAR=1 SPECIAL_MILA_VAR=xyz "
             # Ugly, quite hard-coded.
             f"GIT_COMMIT=abecdef CLUV_CLUSTER={cluster}; "
             "sbatch --parsable --account=my_account --mem=8G --job-name=cluv-my_script "
@@ -350,7 +351,7 @@ class TestGetSbatchCommand:
         )
 
         assert sbatch_command == (
-            "bash --login -c 'MY_VAR=2 GIT_COMMIT=abecdef CLUV_CLUSTER=mila; "
+            "bash --login -c 'export MY_VAR=2 GIT_COMMIT=abecdef CLUV_CLUSTER=mila; "
             "sbatch --parsable --job-name=cluv-my_script "
             f"--output={results_path}/mila_%j/slurm-%j.out --chdir=$HOME/my_project --export=ALL "
             "$HOME/my_project/scripts/my_script.sh '"
@@ -496,7 +497,40 @@ class TestGetSbatchCommand:
         export_flag = next(f for f in sbatch_command.split() if f.startswith("--export="))
         assert export_flag == "--export=ALL"
         # `ALL` is only worth anything because the variables are on the submitting shell:
-        assert "WANDB_MODE=offline GIT_COMMIT=abc123 CLUV_CLUSTER=mila; sbatch" in sbatch_command
+        assert (
+            "export WANDB_MODE=offline GIT_COMMIT=abc123 CLUV_CLUSTER=mila; sbatch"
+            in sbatch_command
+        )
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash to run the command")
+    def test_env_vars_reach_the_sbatch_process(self, tmp_path: Path) -> None:
+        """The variables have to be *exported*, or `sbatch` (and so the job) never sees them.
+
+        Runs the generated inner command locally, with a stub `sbatch` on the PATH that prints the
+        variables it was given. A plain `K=V; sbatch` leaves them as unexported shell variables.
+        """
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "sbatch"
+        stub.write_text('#!/bin/sh\necho "GIT_COMMIT=$GIT_COMMIT MY_VAR=$MY_VAR"\n')
+        stub.chmod(0o755)
+
+        command = get_sbatch_command(
+            job_script=PurePosixPath("job.sh"),
+            sbatch_args={},
+            program_args=[],
+            env_vars={"MY_VAR": "1", "GIT_COMMIT": "abecdef"},
+        )
+        # Drop `--login` so the user's profile can't touch the PATH or the variables under test.
+        inner_command = shlex.split(command.replace("bash --login -c", "bash -c", 1))[2]
+        result = subprocess.run(
+            ["bash", "-c", inner_command],
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "GIT_COMMIT=abecdef MY_VAR=1"
 
     def test_caller_supplied_export_flag_is_replaced_by_cluvs_own(self, project_dir: Path) -> None:
         """A user-supplied `--export=...` is overwritten with cluv's `ALL`, not kept.
