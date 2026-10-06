@@ -256,6 +256,7 @@ async def submit(
     found_running_job = asyncio.Event()
 
     cancelling = False
+    jobs_to_cancel: list[SubmissionProgress] | None = None
 
     def _render() -> rich.table.Table:
         return render_job_table(cluster_to_job_submissions, cancelling=cancelling)
@@ -301,7 +302,7 @@ async def submit(
         raise
     except Exception:
         # Most likely a lost connection. The jobs of the race keep running without cluv.
-        print_cancel_hint(cluster_to_job_submissions, cluster_to_remote, race_id)
+        print_cancel_hint(cluster_to_job_submissions, cluster_to_remote, race_id, jobs_to_cancel)
         raise
 
     job = winning_job.job
@@ -465,18 +466,33 @@ def print_cancel_hint(
     cluster_to_job_submissions: dict[str, list[SubmissionProgress]],
     cluster_to_remote: dict[str, Remote | None],
     race_id: str | None,
+    jobs_to_cancel: list[SubmissionProgress] | None = None,
 ) -> None:
-    """Print the commands that cancel every job of a race that ended abnormally."""
-    if race_id is None:
+    """Print the commands that cancel the jobs left behind by a race that ended abnormally.
+
+    Before a job has started, that is every job of the race, found by name (some job ids may be
+    unknown). Once a job has started, that is only the other jobs, so the one that started is kept.
+    """
+    if race_id is None or jobs_to_cancel == []:
         return
-    print(
-        "The race ended before cluv could cancel the extra jobs. "
-        "To cancel any that are left (including the one you want to keep), run:",
-        file=sys.stderr,
-    )
-    for cluster, rows in cluster_to_job_submissions.items():
-        names = sorted({row.job.sbatch_args["job-name"] for row in rows})
-        scancel = f"scancel --me --name={','.join(names)}"
+    if jobs_to_cancel is None:
+        print("The race ended early. To cancel all of its jobs, run:", file=sys.stderr)
+        cluster_to_scancel = {
+            cluster: "scancel --me --name="
+            + ",".join(sorted({row.job.sbatch_args["job-name"] for row in rows}))
+            for cluster, rows in cluster_to_job_submissions.items()
+        }
+    else:
+        print(
+            "The race ended before cluv could confirm that the extra jobs were cancelled. "
+            "To make sure, run:",
+            file=sys.stderr,
+        )
+        cluster_to_scancel = {
+            cluster: f"scancel {' '.join(str(row.job_id) for row in rows)}"
+            for cluster, rows in group_by_cluster(jobs_to_cancel).items()
+        }
+    for cluster, scancel in cluster_to_scancel.items():
         if cluster_to_remote.get(cluster) is not None:
             scancel = f"ssh {cluster} {shlex.quote(scancel)}"
         print(f"  {scancel}", file=sys.stderr)

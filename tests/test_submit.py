@@ -1386,6 +1386,21 @@ def _submitted_job(job_id: int, cluster: str = "narval") -> SubmissionProgress[J
     return SubmissionProgress(job=job, log_path=Path("job.log"), state="PENDING")
 
 
+def test_cancel_hint_keeps_the_job_that_started(capsys: pytest.CaptureFixture[str]) -> None:
+    """Once a job of the race has started, the hint cancels only the others, by job id."""
+    loser = _submitted_job(222, cluster="tamia")
+    winner = _submitted_job(111, cluster="mila")
+    cluv.cli.submit.print_cancel_hint(
+        {"mila": [winner], "tamia": [loser]},
+        {"mila": unittest.mock.Mock(spec=Remote), "tamia": unittest.mock.Mock(spec=Remote)},
+        race_id="abcd1234",
+        jobs_to_cancel=[loser],
+    )
+    err = capsys.readouterr().err
+    assert "  ssh tamia 'scancel 222'\n" in err
+    assert "mila" not in err
+
+
 @pytest.fixture
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     real_sleep = asyncio.sleep
