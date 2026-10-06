@@ -245,15 +245,18 @@ async def find_all_racers(
 
 
 async def converge(
-    race: Race, cluster_to_remote: dict[str, Remote | None], winner: Racer | None
+    race: Race,
+    cluster_to_remote: dict[str, Remote | None],
+    winner: Racer | None,
+    wait: bool = True,
 ) -> Racer | None:
     """Cancel every live job of the race but one, wait until they're gone, and mark the race
     as resolved.
 
     The job that is kept is `winner` if given (or recorded in the journal). Otherwise, it is the
     first job to have started, or the only one still pending. While several jobs are pending and
-    none have started, this keeps waiting, like `cluv submit` does. No job is kept if the race was
-    interrupted.
+    none have started, this keeps waiting, like `cluv submit` does, unless `wait` is False: then it
+    returns None and leaves the race open. No job is kept if the race was interrupted.
 
     Returns the job that was kept, if any. Raises one of `TRANSIENT_ERRORS` if a cluster stays
     unreachable, leaving the race open.
@@ -270,6 +273,8 @@ async def converge(
                 r for r in racers if r.state == "RUNNING"
             ]
             if not started and len(live) > 1:
+                if not wait:
+                    return None
                 logger.debug(
                     f"{len(live)} jobs of race {race.id} are pending, waiting for one to start."
                 )

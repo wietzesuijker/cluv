@@ -276,6 +276,39 @@ async def test_resume_leaves_the_races_on_disconnected_clusters_open(slurm: Fake
     assert len(slurm.alive()) == 1
 
 
+async def test_next_submit_finishes_an_open_race(slurm: FakeSlurm) -> None:
+    slurm.drop_on = "sacct -j"
+    with pytest.raises(SystemExit):
+        await cluv_submit()
+    slurm.connected = True
+    old_jobs = slurm.alive()
+    assert len(old_jobs) == 2
+
+    await cluv_submit()
+
+    old_race, new_race = load_races().values()
+    assert old_race.resolved and new_race.resolved
+    assert old_race.winner == (CLUSTER, old_jobs[0])
+    assert len(slurm.alive()) == 2  # One job per race.
+
+
+async def test_next_submit_does_not_wait_for_a_pending_race(slurm: FakeSlurm) -> None:
+    slurm.states = ["PENDING", "PENDING"]
+    slurm.drop_on = "sacct -j"
+    with pytest.raises(SystemExit):
+        await cluv_submit()
+    slurm.connected = True
+
+    with console.capture() as capture:
+        await cluv_submit()
+
+    old_race, new_race = load_races().values()
+    assert not old_race.resolved
+    assert new_race.resolved
+    assert "cluv submit --resume" in " ".join(capture.get().split())
+    assert len(slurm.alive()) == 3  # Both pending jobs of the old race, and the new winner.
+
+
 async def test_retrying_recovers_from_a_transient_error() -> None:
     function = unittest.mock.AsyncMock(
         side_effect=[subprocess.CalledProcessError(255, "ssh"), "done"]

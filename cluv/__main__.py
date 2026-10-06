@@ -264,7 +264,8 @@ def add_submit_args(subparsers: Subparsers):
         help=(
             "Instead of submitting a job, finish the races that an interrupted `cluv submit` left "
             "open: keep one job per race and cancel the others, on the clusters that are still "
-            "connected."
+            "connected. Every `cluv submit` also does this first, except for the races whose "
+            "jobs are all still pending."
         ),
     )
     submit_parser.add_argument(
