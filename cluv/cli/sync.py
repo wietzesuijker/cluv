@@ -363,13 +363,13 @@ async def install_uv(remote: Remote, project_state: ProjectStateOnCluster):
         # TODO: Do we want to just install it for them instead? (we already do it on the clusters, why not?)
         raise RuntimeError("`uv` is not installed on this machine.")
 
-    # Get the version of `uv` used here, and install the same version everywhere.
+    # Get the version of `uv` used here, and make sure clusters have at least this version.
     uv_version_here = (
         # uv --version outputs e.g. 'uv 0.11.0 (aarch64-unknown-linux-gnu)'.
         subprocess.getoutput("uv --version").strip().split()[1]
     )
     logger.debug(
-        f"[green]Using uv version {uv_version_here} everywhere, since this is the version on this machine.[/green]"
+        f"[green]Using uv version {uv_version_here} or newer everywhere, since this is the version on this machine.[/green]"
     )
     if project_state.uv_version == uv_version_here:
         logger.info(
@@ -389,8 +389,9 @@ async def install_uv(remote: Remote, project_state: ProjectStateOnCluster):
 
     uv_version_is_different = uv_version.strip() != uv_version_here
     if uv_version_is_different:
-        logger.info(f"Updating uv to version {uv_version_here} on the {remote.hostname} cluster.")
-        await remote.run(f"bash -l -c 'uv self update {uv_version_here}'", hide=True)
+        # Update to the latest rather than to `uv_version_here`, which could be a downgrade.
+        logger.info(f"Updating uv on the {remote.hostname} cluster.")
+        await remote.run("bash -l -c 'uv self update'", hide=True)
 
     project_state.uv_version = uv_version_here
 
