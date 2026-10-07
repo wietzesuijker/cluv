@@ -58,6 +58,7 @@ class ProjectStateOnCluster:
 
     uv_version: str | None = None
     last_uv_sync_git_commit: str | None = None
+    last_uv_sync_uv_version: str | None = None
     last_pushed_datasets: datetime | None = None
     checked_out_git_commit: str | None = None
     last_fetch_watermark: datetime | None = None

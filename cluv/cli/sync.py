@@ -321,8 +321,10 @@ async def run_uv_sync(
     uv_cache_dir: str | None = None,
 ):
     current_git_commit = subprocess.getoutput("git rev-parse HEAD").strip()
-
-    if project_state.last_uv_sync_git_commit == current_git_commit:
+    # A different uv (e.g. updated by another project's sync) may not read the old one's cache.
+    uv_version = await remote.get_output("bash -l -c 'uv --version'", hide=True, display=False)
+    last_sync = (project_state.last_uv_sync_git_commit, project_state.last_uv_sync_uv_version)
+    if last_sync == (current_git_commit, uv_version):
         logger.info(
             f"uv sync was already run for the current commit ({current_git_commit}) on "
             f"{remote.hostname}. Skipping uv sync."
@@ -352,6 +354,7 @@ async def run_uv_sync(
         f"bash --login -c '{env_prefix}uv --directory={project_path} sync --quiet{reinstall_flag}'"
     )
     project_state.last_uv_sync_git_commit = current_git_commit
+    project_state.last_uv_sync_uv_version = uv_version
 
 
 async def install_uv(remote: Remote, project_state: ProjectStateOnCluster):
